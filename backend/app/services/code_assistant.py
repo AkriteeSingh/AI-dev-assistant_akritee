@@ -4,6 +4,7 @@ Rule-based engine with optional LLM integration.
 """
 
 import re
+import ast
 import logging
 from typing import Optional
 from app.schemas import (
@@ -12,6 +13,160 @@ from app.schemas import (
 )
 
 logger = logging.getLogger("qyverix.assistant")
+
+
+def _append_issue(
+    issues: list[DebugIssue],
+    seen: set[tuple[str, Optional[int], str]],
+    issue_type: str,
+    line: Optional[int],
+    description: str,
+    suggestion: str,
+    severity: str,
+) -> None:
+    key = (issue_type, line, description)
+    if key in seen:
+        return
+    issues.append(DebugIssue(
+        type=issue_type,
+        line=line,
+        description=description,
+        suggestion=suggestion,
+        severity=severity,
+    ))
+    seen.add(key)
+
+
+def _python_debug_issues(code: str) -> list[DebugIssue]:
+    issues: list[DebugIssue] = []
+    seen: set[tuple[str, Optional[int], str]] = set()
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        _append_issue(
+            issues,
+            seen,
+            "Syntax Error",
+            exc.lineno,
+            f"Python syntax error: {exc.msg}.",
+            "Fix the syntax near this line (for example missing ':' or unmatched brackets).",
+            "error",
+        )
+        return issues
+
+    input_vars: set[str] = set()
+    list_lengths: dict[str, int] = {}
+    range_limits: dict[str, int] = {}
+    variable_kinds: dict[str, str] = {}
+    divide_param_index: dict[str, int] = {}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            target = node.targets[0].id
+            value = node.value
+            if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "input":
+                input_vars.add(target)
+                variable_kinds[target] = "str"
+            elif isinstance(value, ast.Constant):
+                if isinstance(value.value, str):
+                    variable_kinds[target] = "str"
+                elif isinstance(value.value, (int, float, complex)):
+                    variable_kinds[target] = "number"
+            elif isinstance(value, ast.Call):
+                variable_kinds[target] = "unknown"
+
+            if isinstance(value, (ast.List, ast.Tuple)):
+                list_lengths[target] = len(value.elts)
+
+        if isinstance(node, ast.For) and isinstance(node.target, ast.Name):
+            iter_node = node.iter
+            if (
+                isinstance(iter_node, ast.Call)
+                and isinstance(iter_node.func, ast.Name)
+                and iter_node.func.id == "range"
+                and len(iter_node.args) == 1
+                and isinstance(iter_node.args[0], ast.Constant)
+                and isinstance(iter_node.args[0].value, int)
+            ):
+                range_limits[node.target.id] = iter_node.args[0].value
+
+        if isinstance(node, ast.FunctionDef):
+            arg_names = [a.arg for a in node.args.args]
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.BinOp) and isinstance(inner.op, ast.Div) and isinstance(inner.right, ast.Name):
+                    param = inner.right.id
+                    if param in arg_names:
+                        divide_param_index[node.name] = arg_names.index(param)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare) and isinstance(node.left, ast.Name) and node.left.id in input_vars:
+            has_numeric = any(
+                isinstance(comp, ast.Constant) and isinstance(comp.value, (int, float))
+                for comp in node.comparators
+            )
+            if has_numeric:
+                _append_issue(
+                    issues,
+                    seen,
+                    "Type Error Risk",
+                    node.lineno,
+                    f"Input variable '{node.left.id}' is a string but is compared with a number.",
+                    f"Convert input using int() or float(): {node.left.id} = int(input(...)).",
+                    "error",
+                )
+
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in list_lengths
+            and isinstance(node.slice, ast.Name)
+            and node.slice.id in range_limits
+        ):
+            limit = range_limits[node.slice.id]
+            list_len = list_lengths[node.value.id]
+            if limit > list_len:
+                _append_issue(
+                    issues,
+                    seen,
+                    "Index Error Risk",
+                    node.lineno,
+                    f"Loop can access {node.value.id}[{limit - 1}] but {node.value.id} has only {list_len} item(s).",
+                    f"Use range(len({node.value.id})) or ensure range upper bound is <= {list_len}.",
+                    "error",
+                )
+
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in divide_param_index:
+            idx = divide_param_index[node.func.id]
+            if idx < len(node.args):
+                arg = node.args[idx]
+                if isinstance(arg, ast.Constant) and arg.value == 0:
+                    _append_issue(
+                        issues,
+                        seen,
+                        "ZeroDivisionError",
+                        node.lineno,
+                        f"Function '{node.func.id}' is called with zero denominator argument.",
+                        "Avoid passing 0 as denominator; add a guard clause before dividing.",
+                        "error",
+                    )
+
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left_is_str = isinstance(node.left, ast.Constant) and isinstance(node.left.value, str)
+            if left_is_str and isinstance(node.right, ast.Name):
+                kind = variable_kinds.get(node.right.id)
+                if kind != "str":
+                    _append_issue(
+                        issues,
+                        seen,
+                        "Type Error Risk",
+                        node.lineno,
+                        f"String concatenation uses '{node.right.id}', which may not be a string.",
+                        f"Wrap with str(...): \"...\" + str({node.right.id}) or use an f-string.",
+                        "warning",
+                    )
+
+    return issues
 
 # ── Language Detection ──
 LANG_PATTERNS = {
@@ -108,6 +263,7 @@ DEBUG_RULES = [
 def debug_code(code: str, language: Optional[str] = None) -> DebuggingResponse:
     lang = language or detect_language(code)
     issues: list[DebugIssue] = []
+    seen: set[tuple[str, Optional[int], str]] = set()
     lines_list = code.splitlines()
 
     for rule in DEBUG_RULES:
@@ -115,13 +271,27 @@ def debug_code(code: str, language: Optional[str] = None) -> DebuggingResponse:
             continue
         for i, line in enumerate(lines_list, 1):
             if re.search(rule["pattern"], line, re.IGNORECASE):
-                issues.append(DebugIssue(
-                    type=rule["type"],
-                    line=i,
-                    description=rule["desc"],
-                    suggestion=rule["fix"],
-                    severity=rule["severity"]
-                ))
+                _append_issue(
+                    issues,
+                    seen,
+                    rule["type"],
+                    i,
+                    rule["desc"],
+                    rule["fix"],
+                    rule["severity"],
+                )
+
+    if "python" in lang.lower():
+        for issue in _python_debug_issues(code):
+            _append_issue(
+                issues,
+                seen,
+                issue.type,
+                issue.line,
+                issue.description,
+                issue.suggestion,
+                issue.severity,
+            )
 
     clean = len(issues) == 0
     summary = (
