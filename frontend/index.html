@@ -2364,6 +2364,14 @@
                    style="flex:1;min-width:180px;padding:7px 10px;font-size:0.8rem;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);">
             <button type="submit" id="digestBtn" style="padding:7px 14px;font-size:0.8rem;font-weight:600;background:var(--accent);color:#fff;border:none;border-radius:6px;cursor:pointer;">Subscribe</button>
           </form>
+          <!-- Hidden API status inputs used by the JS. Present to avoid missing DOM refs. -->
+          <div id="apiConfig" class="api-config-row" style="display:none;">
+            <div class="api-status" style="display:flex;align-items:center;gap:8px">
+              <span id="apiDot" class="api-dot" aria-hidden="true"></span>
+              <span id="apiStatusText" data-status="disconnected" style="color:var(--text3);font-size:0.9rem"></span>
+            </div>
+            <input id="apiUrl" placeholder="https://qyverixai.onrender.com" style="display:none;" />
+          </div>
           <p style="margin:6px 0 0;font-size:0.7rem;color:var(--text3);">Get a Sunday email with your weekly analysis stats.</p>
         </div>
       </div>
